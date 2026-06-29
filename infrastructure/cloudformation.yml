@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  BPM Frontend Application Infrastructure - ECS Service and Task Definition.
+  This template provisions the application layer only. Core network infrastructure
+  (VPC, subnets, ALB, security groups) is treated as foundation infrastructure
+  and managed separately. This template is deployed by the CI/CD pipeline on
+  changes to application infrastructure configuration.
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI including tag (e.g. 525125475337.dkr.ecr.eu-west-2.amazonaws.com/bpm-frontend:abc1234)
+
+  AppEnv:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+    Description: Deployment environment
+
+  AppVersion:
+    Type: String
+    Default: '1.0.0'
+    Description: Application version string for health check response
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Number of ECS task instances to run
+
+  # --- Existing Infrastructure References ---
+  # These reference resources that exist as foundation infrastructure.
+  # They are passed as parameters to maintain the IaC contract without
+  # recreating stable, rarely-changed resources on every pipeline run.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0d94945d4db8c3926
+    Description: Existing BPM VPC
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0b65a630428f5da8e
+    Description: bpm-subnet-private-app-2a
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0fd9c6ae9095f8944
+    Description: bpm-subnet-private-app-2b
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-0b74e8a5cf6fc7c04
+    Description: bpm-ecs-sg
+
+  TargetGroupArn:
+    Type: String
+    Default: arn:aws:elasticloadbalancing:eu-west-2:525125475337:targetgroup/bpm-frontend-tg/be0941bb04e8eab1
+    Description: ALB Target Group for bpm-frontend
+
+  TaskExecutionRoleArn:
+    Type: String
+    Default: arn:aws:iam::525125475337:role/BPMAppECSTaskExecutionRole
+    Description: IAM role for ECS task execution
+
+Resources:
+
+  # --- CloudWatch Log Group ---
+  # Centralised logging for container output. Retention set to 30 days
+  # to balance auditability with cost in a regulated environment.
+  BPMFrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/bpm-frontend
+      RetentionInDays: 30
+
+  # --- ECS Task Definition ---
+  # Defines the container specification. Uses the slim Python image
+  # pushed to ECR by the pipeline. Runs as non-root (defined in Dockerfile).
+  BPMFrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: bpm-frontend-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !Ref TaskExecutionRoleArn
+      TaskRoleArn: !Ref TaskExecutionRoleArn
+      ContainerDefinitions:
+        - Name: bpm-frontend-container
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: APP_ENV
+              Value: !Ref AppEnv
+            - Name: APP_VERSION
+              Value: !Ref AppVersion
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/bpm-frontend
+              awslogs-region: eu-west-2
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:80/health')\" || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          ReadonlyRootFilesystem: false
+          Privileged: false
+
+  # --- ECS Service ---
+  # Manages the desired number of running tasks and integrates with
+  # the ALB target group for traffic routing. Deployed into private
+  # app subnets - never directly internet-facing.
+  BPMFrontendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: bpm-frontend
+      Cluster: bpm-cluster
+      TaskDefinition: !Ref BPMFrontendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: bpm-frontend-container
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroupArn
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      HealthCheckGracePeriodSeconds: 30
+
+Outputs:
+  ServiceName:
+    Description: ECS Service Name
+    Value: !GetAtt BPMFrontendService.Name
+
+  TaskDefinitionArn:
+    Description: Task Definition ARN
+    Value: !Ref BPMFrontendTaskDefinition
+
+  LogGroupName:
+    Description: CloudWatch Log Group
+    Value: !Ref BPMFrontendLogGroup

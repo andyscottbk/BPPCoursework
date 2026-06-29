@@ -1,0 +1,247 @@
+name: BPM Frontend CI/CD Pipeline
+
+# Trigger on pushes and pull requests to main.
+# Infrastructure job only runs when infrastructure files change.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: bpm-frontend
+  ECS_CLUSTER: bpm-cluster
+  ECS_SERVICE: bpm-frontend
+  CONTAINER_NAME: bpm-frontend-container
+  STACK_NAME: bpm-frontend-stack
+
+jobs:
+
+  # -------------------------------------------------------
+  # JOB 1: UNIT TESTS
+  # Runs on every push/PR. Validates application logic and
+  # security behaviour before any build occurs.
+  # -------------------------------------------------------
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest app/tests/test_unit.py \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # -------------------------------------------------------
+  # JOB 2: SECURITY SCANNING
+  # Scans Python dependencies for known CVEs.
+  # Fails the pipeline if high-severity vulnerabilities
+  # are found - mandatory for MNPI-handling applications.
+  # -------------------------------------------------------
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Scan dependencies for CVEs
+        run: |
+          pip-audit -r app/requirements.txt --output-format=cyclonedx-json > dependency-scan.json || true
+          pip-audit -r app/requirements.txt
+
+      - name: Upload dependency scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan
+          path: dependency-scan.json
+
+  # -------------------------------------------------------
+  # JOB 3: STATIC CODE ANALYSIS
+  # GitHub CodeQL performs SAST scanning. Equivalent to
+  # SonarQube for security vulnerability detection in source.
+  # -------------------------------------------------------
+  code-quality:
+    name: Static Code Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:python
+
+  # -------------------------------------------------------
+  # JOB 4: BUILD & PUSH DOCKER IMAGE
+  # Only runs on push to main (not PRs).
+  # Builds hardened image and pushes to ECR.
+  # Requires all test and scan jobs to pass first.
+  # -------------------------------------------------------
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [unit-tests, security-scan, code-quality]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Scan container image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
+
+  # -------------------------------------------------------
+  # JOB 5: DEPLOY INFRASTRUCTURE (IaC)
+  # Only runs when infrastructure files change on main.
+  # Uses CloudFormation to provision/update the ECS service
+  # and task definition. Passes the new image URI as a
+  # parameter so the task definition always reflects the
+  # latest build.
+  # -------------------------------------------------------
+  deploy-infrastructure:
+    name: Deploy Infrastructure (IaC)
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation.yml \
+            --stack-name ${{ env.STACK_NAME }} \
+            --parameter-overrides \
+              ImageUri=${{ needs.build-and-push.outputs.image }} \
+              AppEnv=production \
+              AppVersion=${{ github.sha }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --no-fail-on-empty-changeset
+
+      - name: Verify stack deployment
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].StackStatus'
+
+  # -------------------------------------------------------
+  # JOB 6: DEPLOY TO ECS
+  # Forces a new deployment of the ECS service after the
+  # CloudFormation stack has been updated. Waits for the
+  # service to stabilise before marking the job complete.
+  # -------------------------------------------------------
+  deploy-to-ecs:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for service to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Confirm deployment
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}'
