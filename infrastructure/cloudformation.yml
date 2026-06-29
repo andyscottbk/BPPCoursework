@@ -28,23 +28,27 @@ Parameters:
     Description: Number of ECS task instances to run
 
   # --- Existing Foundation Infrastructure References ---
+  # Using plain String types so !Ref resolves correctly inside
+  # AwsvpcConfiguration lists. AWS-specific types (Subnet::Id, SecurityGroup::Id)
+  # add console validation but cause resolution errors in pipeline deployments.
+
   VpcId:
-    Type: AWS::EC2::VPC::Id
+    Type: String
     Default: vpc-0d94945d4db8c3926
     Description: Existing BPM VPC
 
   PrivateSubnet1:
-    Type: AWS::EC2::Subnet::Id
+    Type: String
     Default: subnet-0b65a630428f5da8e
     Description: bpm-subnet-private-app-2a
 
   PrivateSubnet2:
-    Type: AWS::EC2::Subnet::Id
+    Type: String
     Default: subnet-0fd9c6ae9095f8944
     Description: bpm-subnet-private-app-2b
 
   ECSSecurityGroup:
-    Type: AWS::EC2::SecurityGroup::Id
+    Type: String
     Default: sg-0b74e8a5cf6fc7c04
     Description: bpm-ecs-sg
 
