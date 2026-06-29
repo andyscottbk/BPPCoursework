@@ -1,7 +1,8 @@
-name: BPM Frontend CI/CD Pipeline
+name: BPM CI/CD Pipeline
 
-# Trigger on pushes and pull requests to main.
-# Infrastructure job only runs when infrastructure files change.
+# Triggers on push and pull requests to main.
+# Build/deploy jobs only run on push (not PRs) to prevent
+# deploying unreviewed code - important for MNPI compliance.
 on:
   push:
     branches: [ main ]
@@ -13,18 +14,44 @@ env:
   ECR_REPOSITORY: bpm-frontend
   ECS_CLUSTER: bpm-cluster
   ECS_SERVICE: bpm-frontend
-  CONTAINER_NAME: bpm-frontend-container
   STACK_NAME: bpm-frontend-stack
 
 jobs:
 
   # -------------------------------------------------------
-  # JOB 1: UNIT TESTS
-  # Runs on every push/PR. Validates application logic and
-  # security behaviour before any build occurs.
+  # JOB 1: REACT FRONTEND TESTS
+  # Runs Vitest unit tests for the React application.
+  # Tests component rendering and API integration behaviour.
   # -------------------------------------------------------
-  unit-tests:
-    name: Unit Tests
+  frontend-tests:
+    name: React Frontend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run React tests
+        working-directory: frontend
+        run: npm test
+
+  # -------------------------------------------------------
+  # JOB 2: PYTHON API UNIT TESTS
+  # Validates Flask API endpoints and security behaviour.
+  # Includes coverage reporting.
+  # -------------------------------------------------------
+  backend-tests:
+    name: Python API Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -51,17 +78,17 @@ jobs:
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          name: python-coverage-report
           path: coverage.xml
 
   # -------------------------------------------------------
-  # JOB 2: SECURITY SCANNING
-  # Scans Python dependencies for known CVEs.
-  # Fails the pipeline if high-severity vulnerabilities
-  # are found - mandatory for MNPI-handling applications.
+  # JOB 3: SECURITY SCANNING
+  # Scans Python dependencies for known CVEs using pip-audit.
+  # Mandatory gate for MNPI-handling applications in a
+  # regulated financial environment.
   # -------------------------------------------------------
   security-scan:
-    name: Security Scan
+    name: Dependency Security Scan
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -75,21 +102,18 @@ jobs:
       - name: Install pip-audit
         run: pip install pip-audit
 
-      - name: Scan dependencies for CVEs
-        run: |
-          pip-audit -r app/requirements.txt --output-format=cyclonedx-json > dependency-scan.json || true
-          pip-audit -r app/requirements.txt
+      - name: Scan Python dependencies for CVEs
+        run: pip-audit -r app/requirements.txt
 
-      - name: Upload dependency scan results
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-scan
-          path: dependency-scan.json
+      - name: Scan npm dependencies for vulnerabilities
+        working-directory: frontend
+        run: npm audit --audit-level=high
 
   # -------------------------------------------------------
-  # JOB 3: STATIC CODE ANALYSIS
-  # GitHub CodeQL performs SAST scanning. Equivalent to
-  # SonarQube for security vulnerability detection in source.
+  # JOB 4: STATIC CODE ANALYSIS (SAST)
+  # GitHub CodeQL scans both Python and JavaScript source.
+  # Equivalent to SonarQube - catches security vulnerabilities
+  # before they reach a build.
   # -------------------------------------------------------
   code-quality:
     name: Static Code Analysis
@@ -105,23 +129,21 @@ jobs:
       - name: Initialise CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: python
+          languages: python, javascript
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
-        with:
-          category: /language:python
 
   # -------------------------------------------------------
-  # JOB 4: BUILD & PUSH DOCKER IMAGE
-  # Only runs on push to main (not PRs).
-  # Builds hardened image and pushes to ECR.
-  # Requires all test and scan jobs to pass first.
+  # JOB 5: BUILD & PUSH DOCKER IMAGE
+  # Only runs on push to main after all tests pass.
+  # Multi-stage build: Node (React) -> Python/Nginx production.
+  # Image tagged with commit SHA for full traceability.
   # -------------------------------------------------------
   build-and-push:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
-    needs: [unit-tests, security-scan, code-quality]
+    needs: [frontend-tests, backend-tests, security-scan, code-quality]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     outputs:
       image: ${{ steps.build-image.outputs.image }}
@@ -152,7 +174,7 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Scan container image for vulnerabilities
+      - name: Scan container image for vulnerabilities (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.build-image.outputs.image }}
@@ -161,15 +183,13 @@ jobs:
           severity: CRITICAL,HIGH
 
   # -------------------------------------------------------
-  # JOB 5: DEPLOY INFRASTRUCTURE (IaC)
-  # Only runs when infrastructure files change on main.
-  # Uses CloudFormation to provision/update the ECS service
-  # and task definition. Passes the new image URI as a
-  # parameter so the task definition always reflects the
-  # latest build.
+  # JOB 6: DEPLOY INFRASTRUCTURE (IaC)
+  # Runs CloudFormation deploy to update the ECS task
+  # definition with the new image URI. Uses --no-fail-on-empty-changeset
+  # so unchanged infrastructure does not fail the pipeline.
   # -------------------------------------------------------
   deploy-infrastructure:
-    name: Deploy Infrastructure (IaC)
+    name: Deploy Infrastructure
     runs-on: ubuntu-latest
     needs: [build-and-push]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -197,18 +217,24 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --no-fail-on-empty-changeset
 
-      - name: Verify stack deployment
+      - name: Verify stack is in a healthy state
         run: |
-          aws cloudformation describe-stacks \
+          STATUS=$(aws cloudformation describe-stacks \
             --stack-name ${{ env.STACK_NAME }} \
             --region ${{ env.AWS_REGION }} \
-            --query 'Stacks[0].StackStatus'
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+          echo "Stack status: $STATUS"
+          if [[ "$STATUS" != *"COMPLETE"* ]]; then
+            echo "Stack is not in a healthy state: $STATUS"
+            exit 1
+          fi
 
   # -------------------------------------------------------
-  # JOB 6: DEPLOY TO ECS
-  # Forces a new deployment of the ECS service after the
-  # CloudFormation stack has been updated. Waits for the
-  # service to stabilise before marking the job complete.
+  # JOB 7: DEPLOY TO ECS
+  # Forces a new deployment using the updated task definition.
+  # Waits for the service to stabilise before completing -
+  # ensures failed deployments are caught in the pipeline.
   # -------------------------------------------------------
   deploy-to-ecs:
     name: Deploy to ECS
@@ -238,7 +264,7 @@ jobs:
             --services ${{ env.ECS_SERVICE }} \
             --region ${{ env.AWS_REGION }}
 
-      - name: Confirm deployment
+      - name: Confirm running task count
         run: |
           aws ecs describe-services \
             --cluster ${{ env.ECS_CLUSTER }} \

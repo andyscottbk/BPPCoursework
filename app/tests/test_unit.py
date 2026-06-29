@@ -1,4 +1,4 @@
-"""Unit tests for BPM Frontend Flask application."""
+"""Unit tests for BPM Flask API backend."""
 import pytest
 import sys
 import os
@@ -17,7 +17,7 @@ def client():
 
 
 class TestHealthEndpoint:
-    """Tests for the /health endpoint."""
+    """Tests for the /health endpoint - critical for ALB routing."""
 
     def test_health_returns_200(self, client):
         """Health endpoint must return HTTP 200 for ALB health checks."""
@@ -43,22 +43,8 @@ class TestHealthEndpoint:
         assert data['service'] == 'bpm-frontend'
 
 
-class TestIndexEndpoint:
-    """Tests for the root / endpoint."""
-
-    def test_index_returns_200(self, client):
-        """Index page must return HTTP 200."""
-        response = client.get('/')
-        assert response.status_code == 200
-
-    def test_index_returns_html(self, client):
-        """Index page must return HTML content."""
-        response = client.get('/')
-        assert b'BPM' in response.data
-
-
 class TestStatusEndpoint:
-    """Tests for the /api/status endpoint."""
+    """Tests for the /api/status endpoint consumed by the React frontend."""
 
     def test_status_returns_200(self, client):
         """Status endpoint must return HTTP 200."""
@@ -82,18 +68,18 @@ class TestStatusEndpoint:
         data = response.get_json()
         assert 'environment' in data
 
+    def test_status_contains_application(self, client):
+        """Status must identify the application."""
+        response = client.get('/api/status')
+        data = response.get_json()
+        assert data['application'] == 'bpm-frontend'
+
 
 class TestSecurityHeaders:
     """Security-focused tests relevant to MNPI handling."""
 
-    def test_no_server_header_leakage(self, client):
-        """Server header should not expose detailed version info."""
-        response = client.get('/health')
-        server_header = response.headers.get('Server', '')
-        assert 'Werkzeug' not in server_header or response.status_code == 200
-
     def test_invalid_route_returns_404(self, client):
-        """Unknown routes must return 404, not expose stack traces."""
+        """Unknown routes must return 404 - no stack trace exposure."""
         response = client.get('/mnpi/data')
         assert response.status_code == 404
 
@@ -101,3 +87,19 @@ class TestSecurityHeaders:
         """POST to GET-only endpoints must return 405."""
         response = client.post('/health')
         assert response.status_code == 405
+
+    def test_health_does_not_expose_env_vars(self, client):
+        """Health endpoint must not leak environment variables."""
+        response = client.get('/health')
+        data = response.get_json()
+        sensitive_keys = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'DB_PASSWORD']
+        for key in sensitive_keys:
+            assert key not in data
+
+    def test_status_does_not_expose_secrets(self, client):
+        """Status endpoint must not expose sensitive configuration."""
+        response = client.get('/api/status')
+        data = response.get_json()
+        assert 'secret' not in str(data).lower()
+        assert 'password' not in str(data).lower()
+        assert 'key' not in str(data).lower()

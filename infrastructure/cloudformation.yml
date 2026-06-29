@@ -1,10 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  BPM Frontend Application Infrastructure - ECS Service and Task Definition.
-  This template provisions the application layer only. Core network infrastructure
-  (VPC, subnets, ALB, security groups) is treated as foundation infrastructure
-  and managed separately. This template is deployed by the CI/CD pipeline on
-  changes to application infrastructure configuration.
+  BPM Frontend Application Infrastructure - ECS Fargate Service and Task Definition.
+  Provisions the application layer only. Core network infrastructure (VPC, subnets,
+  ALB, security groups) is managed separately as foundation infrastructure.
+  Deployed by the CI/CD pipeline on every push to main.
 
 Parameters:
   ImageUri:
@@ -28,11 +27,7 @@ Parameters:
     MinValue: 0
     Description: Number of ECS task instances to run
 
-  # --- Existing Infrastructure References ---
-  # These reference resources that exist as foundation infrastructure.
-  # They are passed as parameters to maintain the IaC contract without
-  # recreating stable, rarely-changed resources on every pipeline run.
-
+  # --- Existing Foundation Infrastructure References ---
   VpcId:
     Type: AWS::EC2::VPC::Id
     Default: vpc-0d94945d4db8c3926
@@ -61,24 +56,31 @@ Parameters:
   TaskExecutionRoleArn:
     Type: String
     Default: arn:aws:iam::525125475337:role/BPMAppECSTaskExecutionRole
-    Description: IAM role for ECS task execution
+    Description: IAM role for ECS task execution (pull images, write logs)
+
+  TaskRoleArn:
+    Type: String
+    Default: arn:aws:iam::525125475337:role/BPMAppECSTaskExecutionRole
+    Description: IAM role for the running task (Secrets Manager read access)
 
 Resources:
 
   # --- CloudWatch Log Group ---
-  # Centralised logging for container output. Retention set to 30 days
-  # to balance auditability with cost in a regulated environment.
+  # Centralised logging. 30-day retention balances audit requirements with cost.
+  # Log Group created before the task definition to prevent race condition.
   BPMFrontendLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
     Properties:
       LogGroupName: /ecs/bpm-frontend
       RetentionInDays: 30
 
   # --- ECS Task Definition ---
-  # Defines the container specification. Uses the slim Python image
-  # pushed to ECR by the pipeline. Runs as non-root (defined in Dockerfile).
+  # Runs as non-root (enforced in Dockerfile). Secrets pulled from
+  # AWS Secrets Manager at runtime - never stored in environment variables.
   BPMFrontendTaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    DependsOn: BPMFrontendLogGroup
     Properties:
       Family: bpm-frontend-task
       NetworkMode: awsvpc
@@ -87,7 +89,7 @@ Resources:
       Cpu: '256'
       Memory: '512'
       ExecutionRoleArn: !Ref TaskExecutionRoleArn
-      TaskRoleArn: !Ref TaskExecutionRoleArn
+      TaskRoleArn: !Ref TaskRoleArn
       ContainerDefinitions:
         - Name: bpm-frontend-container
           Image: !Ref ImageUri
@@ -106,23 +108,25 @@ Resources:
               awslogs-group: /ecs/bpm-frontend
               awslogs-region: eu-west-2
               awslogs-stream-prefix: ecs
+          # Health check via curl to Nginx which proxies to Flask /health
+          # curl is installed in the Dockerfile for this purpose
           HealthCheck:
             Command:
               - CMD-SHELL
-              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:80/health')\" || exit 1"
+              - "curl -f http://localhost:80/health || exit 1"
             Interval: 30
             Timeout: 5
             Retries: 3
-            StartPeriod: 10
+            StartPeriod: 15
           ReadonlyRootFilesystem: false
           Privileged: false
 
   # --- ECS Service ---
-  # Manages the desired number of running tasks and integrates with
-  # the ALB target group for traffic routing. Deployed into private
-  # app subnets - never directly internet-facing.
+  # Private subnets only - never directly internet-facing.
+  # ALB handles all public traffic and TLS termination.
   BPMFrontendService:
     Type: AWS::ECS::Service
+    DependsOn: BPMFrontendTaskDefinition
     Properties:
       ServiceName: bpm-frontend
       Cluster: bpm-cluster
